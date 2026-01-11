@@ -157,6 +157,18 @@ automation:
       - service: lockmaster.fetchusers
 ```
 
+## PIN Validation Rules
+
+When setting a PIN, LockMaster enforces:
+
+- **Length** - Must be 4-8 digits
+- **Numeric only** - Letters and symbols not allowed
+- **No repeating digits** - PINs like "1111" or "0000" are rejected
+- **Unique** - Each PIN must be unique across all enabled users
+- **Non-zero** - PIN cannot be "0" or empty
+
+If validation fails, the update is rejected with an error message.
+
 ## Cross-Lock PIN Sync
 
 LockMaster automatically detects when PINs differ between locks for the same user slot. When a mismatch is detected:
