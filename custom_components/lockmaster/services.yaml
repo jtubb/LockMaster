@@ -1,0 +1,95 @@
+add_lock:
+  name: Add Lock
+  description: Add a new lock to manage.
+  fields:
+    lock_name:
+      name: Lock Name
+      description: The name of the lock as it appears in zigbee2mqtt.
+      required: true
+      example: "Front Door Lock"
+      selector:
+        text:
+
+fetch_users:
+  name: Fetch Users
+  description: Fetch user data from all managed locks.
+
+refresh_users:
+  name: Refresh Users
+  description: Run consistency check and update Home Assistant entities.
+
+update_user:
+  name: Update User
+  description: Update a user's information and PIN.
+  fields:
+    user_id:
+      name: User ID
+      description: The user slot ID (0-29).
+      required: true
+      example: "1"
+      selector:
+        text:
+    name:
+      name: Name
+      description: The user's name.
+      required: true
+      example: "John Smith"
+      selector:
+        text:
+    email:
+      name: Email
+      description: The user's email address.
+      required: true
+      example: "john@example.com"
+      selector:
+        text:
+    pin:
+      name: PIN
+      description: The PIN code (4-8 digits, not all same number).
+      required: true
+      example: "1234"
+      selector:
+        text:
+
+disable_user:
+  name: Disable User
+  description: Disable a user and remove their PIN from all locks.
+  fields:
+    user_id:
+      name: User ID
+      description: The user slot ID to disable.
+      required: true
+      example: "1"
+      selector:
+        text:
+
+generate_temp_user:
+  name: Generate Temporary User
+  description: Create a temporary user with a random PIN.
+  fields:
+    name:
+      name: Name
+      description: The temporary user's name.
+      required: true
+      example: "Guest User"
+      selector:
+        text:
+    email:
+      name: Email
+      description: The temporary user's email address.
+      required: true
+      example: "guest@example.com"
+      selector:
+        text:
+    reservation_start:
+      name: Start Time
+      description: When access should begin.
+      required: true
+      selector:
+        datetime:
+    reservation_end:
+      name: End Time
+      description: When access should end.
+      required: true
+      selector:
+        datetime:
