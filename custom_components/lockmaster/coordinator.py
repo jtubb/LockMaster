@@ -44,6 +44,7 @@ class LockMasterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _mqtt_publish(self, topic: str, payload: str) -> None:
         """Publish MQTT message."""
+        _LOGGER.debug("MQTT publish: %s -> %s", topic, payload)
         await mqtt.async_publish(self.hass, topic, payload)
 
     async def _on_manager_update(self) -> None:

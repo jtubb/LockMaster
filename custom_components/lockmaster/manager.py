@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import logging
 import random
 import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from pyisemail import is_email
 
@@ -19,6 +24,9 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Timeout for waiting for lock confirmation (seconds)
+LOCK_CONFIRMATION_TIMEOUT = 10
 
 
 @dataclass
@@ -95,8 +103,11 @@ class LockManager:
         self.users: dict[str, LMUser] = {}
         self.locks: dict[str, Lock] = {}
         self.last_update: float = datetime.utcnow().timestamp()
-        self._mqtt_publish: callable = None
-        self._update_callback: callable = None
+        self._mqtt_publish: Callable | None = None
+        self._update_callback: Callable | None = None
+        # Pending operations: {device_name: {operation_type: asyncio.Event}}
+        # operation_type is "add" or "delete"
+        self._pending_operations: dict[str, dict[str, asyncio.Event]] = {}
 
     @property
     def max_slots(self) -> int:
@@ -119,6 +130,55 @@ class LockManager:
         """Notify that data has been updated."""
         if self._update_callback:
             await self._update_callback()
+
+    async def _wait_for_lock_confirmations(
+        self, operation_type: str, timeout: float = LOCK_CONFIRMATION_TIMEOUT
+    ) -> dict[str, bool]:
+        """Wait for all locks to confirm an operation.
+
+        Events must be set up in _pending_operations before calling this method.
+
+        Args:
+            operation_type: "add" or "delete"
+            timeout: Maximum seconds to wait for each lock
+
+        Returns:
+            Dict mapping lock name to success (True if confirmed, False if timed out)
+        """
+        results: dict[str, bool] = {}
+
+        # Wait for all locks to confirm
+        for device_name in self.locks:
+            if device_name not in self._pending_operations:
+                results[device_name] = False
+                _LOGGER.warning("No pending operation for %s", device_name)
+                continue
+
+            if operation_type not in self._pending_operations[device_name]:
+                results[device_name] = False
+                _LOGGER.warning("No %s operation pending for %s", operation_type, device_name)
+                continue
+
+            event = self._pending_operations[device_name][operation_type]
+            try:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
+                results[device_name] = True
+                _LOGGER.debug("Lock %s confirmed %s", device_name, operation_type)
+            except asyncio.TimeoutError:
+                results[device_name] = False
+                _LOGGER.warning(
+                    "Lock %s did not confirm %s within %s seconds",
+                    device_name, operation_type, timeout
+                )
+
+        # Clean up pending operations
+        for device_name in list(self._pending_operations.keys()):
+            if device_name in self._pending_operations:
+                self._pending_operations[device_name].pop(operation_type, None)
+                if not self._pending_operations[device_name]:
+                    del self._pending_operations[device_name]
+
+        return results
 
     def add_lock(self, lock_name: str) -> None:
         """Add a lock to manage."""
@@ -176,7 +236,8 @@ class LockManager:
                 lock.users.setdefault(str(i), LockUser())
 
         for user_id, user_data in response["users"].items():
-            lock.users[user_id].status = user_data.get("status", STATUS_AVAILABLE)
+            user_status = user_data.get("status", STATUS_AVAILABLE)
+            lock.users[user_id].status = user_status
 
             pin_value = user_data.get("pin_code")
             if isinstance(pin_value, dict):
@@ -190,8 +251,12 @@ class LockManager:
                 else:
                     pin_value = None
 
-            if pin_value and str(pin_value).isdigit():
+            # Only use the PIN if the lock reports the user as enabled
+            # Lock firmware may report old PIN data even for available slots
+            if pin_value and str(pin_value).isdigit() and user_status == STATUS_ENABLED:
                 lock.users[user_id].pin = str(pin_value)
+            else:
+                lock.users[user_id].pin = None
 
         if lock.callback_count >= len(lock.users):
             lock.callback_count = 0
@@ -208,6 +273,14 @@ class LockManager:
 
         if payload in ("pin_code_added", "pin_code_deleted"):
             self.last_update = datetime.utcnow().timestamp()
+
+            # Signal any pending operations for this device
+            operation_type = "add" if payload == "pin_code_added" else "delete"
+            if device in self._pending_operations:
+                if operation_type in self._pending_operations[device]:
+                    self._pending_operations[device][operation_type].set()
+                    _LOGGER.debug("Lock %s confirmed %s operation", device, operation_type)
+
             return f"Pin Code Changed: {payload}"
         return None
 
@@ -346,6 +419,13 @@ class LockManager:
             response["status"] = "MQTT not configured"
             return response
 
+        # Set up pending operations before publishing
+        for device_id in self.locks:
+            if device_id not in self._pending_operations:
+                self._pending_operations[device_id] = {}
+            self._pending_operations[device_id]["add"] = asyncio.Event()
+
+        # Publish to all locks
         for device_id in self.locks:
             await self._mqtt_publish(
                 f"zigbee2mqtt/{device_id}/set",
@@ -359,6 +439,15 @@ class LockManager:
                 }),
             )
 
+        # Wait for lock confirmations
+        confirmations = await self._wait_for_lock_confirmations("add")
+        failed_locks = [name for name, confirmed in confirmations.items() if not confirmed]
+
+        if failed_locks:
+            response["success"] = False
+            response["status"] = f"Timeout waiting for confirmation from: {', '.join(failed_locks)}"
+            return response
+
         self.users[user_id].pin = pin
         self.users[user_id].status = STATUS_ENABLED
         self.users[user_id].last_update = datetime.utcnow().timestamp()
@@ -366,7 +455,7 @@ class LockManager:
         await self._notify_update()
 
         response["success"] = True
-        response["status"] = f"Updated user {self.users[user_id].name}"
+        response["status"] = f"Updated user {self.users[user_id].name} (confirmed by all locks)"
         return response
 
     async def disable_user(self, user_id: str) -> dict:
@@ -387,6 +476,13 @@ class LockManager:
             response["status"] = "MQTT not configured"
             return response
 
+        # Set up pending operations before publishing
+        for device_id in self.locks:
+            if device_id not in self._pending_operations:
+                self._pending_operations[device_id] = {}
+            self._pending_operations[device_id]["delete"] = asyncio.Event()
+
+        # Publish to all locks
         for device_id in self.locks:
             await self._mqtt_publish(
                 f"zigbee2mqtt/{device_id}/set",
@@ -398,6 +494,15 @@ class LockManager:
                 }),
             )
 
+        # Wait for lock confirmations
+        confirmations = await self._wait_for_lock_confirmations("delete")
+        failed_locks = [name for name, confirmed in confirmations.items() if not confirmed]
+
+        if failed_locks:
+            response["success"] = False
+            response["status"] = f"Timeout waiting for confirmation from: {', '.join(failed_locks)}"
+            return response
+
         self.users[user_id].pin = DEFAULT_PIN
         self.users[user_id].status = STATUS_AVAILABLE
         self.users[user_id].email = DEFAULT_EMAIL
@@ -407,7 +512,7 @@ class LockManager:
         await self._notify_update()
 
         response["success"] = True
-        response["status"] = f"Disabled user {original_name}."
+        response["status"] = f"Disabled user {original_name} (confirmed by all locks)"
         return response
 
     async def allocate_temp_user(

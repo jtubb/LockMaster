@@ -192,6 +192,10 @@ LockMaster automatically detects when PINs differ between locks for the same use
 - Zigbee2MQTT with MQTT integration
 - Compatible Zigbee door lock(s)
 
+## Credits
+
+Icon by [Icons8](https://icons8.com)
+
 ## License
 
 MIT License
