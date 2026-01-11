@@ -39,18 +39,15 @@ Works with Zigbee locks that support PIN codes via Zigbee2MQTT, including:
 2. Search for "LockMaster"
 3. Complete the setup
 
-## Lovelace Card Setup
+## Lovelace Card
 
-Add the card resource:
-
-1. Go to **Settings** → **Dashboards** → **Resources**
-2. Add `/local/lockmaster-card.js` as JavaScript Module
+Install the companion Lovelace card from [lockmaster-card](https://github.com/jtubb/lockmaster-card).
 
 Add the card to your dashboard:
 
 ```yaml
 type: custom:lockmaster-card
-entity: sensor.lockmaster_users
+entity: sensor.lockmaster_user_list
 ```
 
 ## Services
