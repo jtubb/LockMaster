@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime
 import json
 import logging
 from typing import Any
@@ -16,6 +19,28 @@ from .const import CONF_LOCKS, DOMAIN
 from .manager import LockManager
 
 _LOGGER = logging.getLogger(__name__)
+
+# Lock event fields from zigbee2mqtt
+LOCK_EVENT_ACTION = "action"
+LOCK_EVENT_USER = "action_user"
+LOCK_EVENT_SOURCE = "action_source_name"
+
+# Master user code in zigbee2mqtt
+MASTER_USER_CODE = "65535"
+
+# Time to wait for all event fields to arrive before firing event
+LOCK_EVENT_DEBOUNCE_SECONDS = 0.5
+
+
+@dataclass
+class PendingLockEvent:
+    """Pending lock event data being collected."""
+
+    action: str | None = None
+    user: str | None = None
+    source: str | None = None
+    timestamp: datetime = field(default_factory=datetime.now)
+    timer_task: asyncio.Task | None = None
 
 STORAGE_VERSION = 1
 STORAGE_KEY = f"{DOMAIN}.storage"
@@ -37,6 +62,9 @@ class LockMasterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.manager = LockManager()
         self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self._unsubscribe_mqtt: list[callable] = []
+
+        # Pending lock events being collected (key: lock name)
+        self._pending_lock_events: dict[str, PendingLockEvent] = {}
 
         # Set up callbacks
         self.manager.set_mqtt_publish(self._mqtt_publish)
@@ -127,6 +155,9 @@ class LockMasterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except (json.JSONDecodeError, TypeError):
             return
 
+        # Check for lock event fields (action, action_user, action_source_name)
+        self._collect_lock_event(device, payload)
+
         self.hass.async_create_task(
             self.manager.process_lock_callback(device, payload)
         )
@@ -157,12 +188,92 @@ class LockMasterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 {"message": notification, "device": device},
             )
 
+    def _collect_lock_event(self, device: str, payload: dict) -> None:
+        """Collect lock event data and fire event when complete."""
+        action = payload.get(LOCK_EVENT_ACTION)
+        user = payload.get(LOCK_EVENT_USER)
+        source = payload.get(LOCK_EVENT_SOURCE)
+
+        # Only process if we have at least one event field
+        if not any([action, user, source]):
+            return
+
+        # Get or create pending event for this device
+        if device not in self._pending_lock_events:
+            self._pending_lock_events[device] = PendingLockEvent()
+
+        pending = self._pending_lock_events[device]
+
+        # Update with new data (non-None values)
+        if action:
+            pending.action = action
+        if user is not None:
+            # Convert master user code to friendly name
+            pending.user = "Master" if str(user) == MASTER_USER_CODE else str(user)
+        if source:
+            pending.source = source
+
+        pending.timestamp = datetime.now()
+
+        # Cancel existing timer if any
+        if pending.timer_task and not pending.timer_task.done():
+            pending.timer_task.cancel()
+
+        # Start debounce timer to fire event
+        pending.timer_task = self.hass.async_create_task(
+            self._debounce_fire_lock_event(device)
+        )
+
+    async def _debounce_fire_lock_event(self, device: str) -> None:
+        """Wait for debounce period then fire lock event."""
+        await asyncio.sleep(LOCK_EVENT_DEBOUNCE_SECONDS)
+        await self._fire_lock_event(device)
+
+    async def _fire_lock_event(self, device: str) -> None:
+        """Fire the collected lock event."""
+        if device not in self._pending_lock_events:
+            return
+
+        pending = self._pending_lock_events[device]
+
+        # Only fire if we have at least action data
+        if not pending.action:
+            return
+
+        # Look up user name from lockmaster users if we have a numeric user ID
+        user_name = pending.user
+        if user_name and user_name.isdigit():
+            lm_user = self.manager.get_user(user_name)
+            if lm_user and lm_user.name:
+                user_name = lm_user.name
+
+        event_data = {
+            "device": device,
+            "action": pending.action,
+            "user": user_name,
+            "source": pending.source,
+            "timestamp": pending.timestamp.isoformat(),
+        }
+
+        _LOGGER.debug("Firing lock event: %s", event_data)
+
+        self.hass.bus.async_fire(f"{DOMAIN}_lock_event", event_data)
+
+        # Clear pending event
+        del self._pending_lock_events[device]
+
     async def _save_state(self) -> None:
         """Save state to storage."""
         await self._store.async_save(self.manager.save_state())
 
     async def async_shutdown(self) -> None:
         """Shutdown coordinator."""
+        # Cancel any pending lock event timers
+        for pending in self._pending_lock_events.values():
+            if pending.timer_task and not pending.timer_task.done():
+                pending.timer_task.cancel()
+        self._pending_lock_events.clear()
+
         # Unsubscribe from MQTT
         for unsub in self._unsubscribe_mqtt:
             unsub()
