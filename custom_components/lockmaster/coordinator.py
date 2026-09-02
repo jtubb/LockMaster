@@ -31,6 +31,12 @@ MASTER_USER_CODE = "65535"
 # Time to wait for all event fields to arrive before firing event
 LOCK_EVENT_DEBOUNCE_SECONDS = 0.5
 
+# Suppress identical (action, user, source) repeats within this window.
+# Kwikset locks in a stuck state retransmit the same OperationEventNotification
+# every ~30s; a legitimate human repeat of the exact same action+user+source
+# within a minute is vanishingly unlikely, so 60s is a safe gate.
+LOCK_EVENT_DEDUP_SECONDS = 60
+
 
 @dataclass
 class PendingLockEvent:
@@ -65,6 +71,12 @@ class LockMasterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Pending lock events being collected (key: lock name)
         self._pending_lock_events: dict[str, PendingLockEvent] = {}
+
+        # Last fired event per device, for duplicate suppression.
+        # Value is ((action, user, source), timestamp).
+        self._last_fired_events: dict[
+            str, tuple[tuple[str | None, str | None, str | None], datetime]
+        ] = {}
 
         # Set up callbacks
         self.manager.set_mqtt_publish(self._mqtt_publish)
@@ -246,6 +258,28 @@ class LockMasterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             lm_user = self.manager.get_user(user_name)
             if lm_user and lm_user.name:
                 user_name = lm_user.name
+
+        # Suppress identical repeats within LOCK_EVENT_DEDUP_SECONDS. Handles
+        # stuck-lock retransmit loops (same action+user+source every ~30s)
+        # without losing legitimate repeated actions on a human cadence.
+        event_key = (pending.action, user_name, pending.source)
+        now = datetime.now()
+        last = self._last_fired_events.get(device)
+        if last is not None:
+            last_key, last_time = last
+            if (
+                last_key == event_key
+                and (now - last_time).total_seconds() < LOCK_EVENT_DEDUP_SECONDS
+            ):
+                _LOGGER.debug(
+                    "Suppressing duplicate lock event for %s: %s",
+                    device,
+                    event_key,
+                )
+                del self._pending_lock_events[device]
+                return
+
+        self._last_fired_events[device] = (event_key, now)
 
         event_data = {
             "device": device,
